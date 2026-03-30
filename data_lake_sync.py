@@ -1,8 +1,6 @@
 import gzip
 import io
-import logging
 import os
-from datetime import datetime
 from datetime import timezone
 
 import boto3
@@ -88,8 +86,8 @@ class DataLakeSync(object):
             self._adls_client = DataLakeServiceClient(
                 account_url=self.settings.adls_account_url,
                 credential=credential,
-                max_chunk_get_size=settings.chunk_size,
-                max_single_get_size=settings.chunk_size,
+                max_chunk_get_size=self.settings.chunk_size,
+                max_single_get_size=self.settings.chunk_size,
             )
             return self._adls_client
         except Exception as exception:
@@ -130,8 +128,8 @@ class DataLakeSync(object):
 
     def s3_file_path(self, adls_file_path, adls_file_date, file_is_archive):
         adls_file_path_clean = adls_file_path.lstrip("/")
-        adls_file_date_prefix = adls_file_date.strftime(self.settings.s3_date_prefix)
         if len(self.settings.s3_date_prefix) > 0:
+            adls_file_date_prefix = adls_file_date.strftime(self.settings.s3_date_prefix)
             s3_file_path = "{0}{1}{2}".format(
                 adls_file_date_prefix,
                 self.settings.s3_path_separator,
@@ -207,46 +205,46 @@ class DataLakeSync(object):
             adls_file_client = adls_fs_client.get_file_client(adls_file_path)
             adls_file_download = adls_file_client.download_file()
 
-            upload_buffer = io.BytesIO()
+            with io.BytesIO() as upload_buffer:
 
-            try:
-                if adls_file_is_archive:
-                    self.log.debug("File is already an archive. Uploading without compression.")
-                    for chunk in adls_file_download.chunks():
-                        upload_buffer.write(chunk)
-                else:
-                    self.log.debug("File is not archive. Compressing the file with gzip during upload.")
-                    with gzip.GzipFile(fileobj=upload_buffer, mode='wb') as gz_io:
+                try:
+                    if adls_file_is_archive:
+                        self.log.debug("File is already an archive. Uploading without compression.")
                         for chunk in adls_file_download.chunks():
-                            gz_io.write(chunk)
-            except Exception as exception:
-                files_error += 1
-                self.log.warning(
-                    "Reading the file: {file} from the ADLS container: {container} failed! {exception}",
-                    file=adls_file_path,
-                    container=self.settings.adls_container_name,
-                    exception=exception
-                )
-                continue
+                            upload_buffer.write(chunk)
+                    else:
+                        self.log.debug("File is not archive. Compressing the file with gzip during upload.")
+                        with gzip.GzipFile(fileobj=upload_buffer, mode='wb') as gz_io:
+                            for chunk in adls_file_download.chunks():
+                                gz_io.write(chunk)
+                except Exception as exception:
+                    files_error += 1
+                    self.log.warning(
+                        "Reading the file: {file} from the ADLS container: {container} failed! {exception}",
+                        file=adls_file_path,
+                        container=self.settings.adls_container_name,
+                        exception=exception
+                    )
+                    continue
 
-            upload_buffer.seek(0)
+                upload_buffer.seek(0)
 
-            try:
-                self.s3_client.upload_fileobj(
-                    upload_buffer,
-                    self.settings.s3_bucket_name,
-                    s3_file_path,
-                    Config=TransferConfig(multipart_chunksize=settings.chunk_size),
-                )
-            except Exception as exception:
-                files_error += 1
-                self.log.warning(
-                    "Upload of file: {file} to the bucket: {bucket} failed! {exception}",
-                    file=s3_file_path,
-                    bucket=self.settings.s3_bucket_name,
-                    exception=exception
-                )
-                continue
+                try:
+                    self.s3_client.upload_fileobj(
+                        upload_buffer,
+                        self.settings.s3_bucket_name,
+                        s3_file_path,
+                        Config=TransferConfig(multipart_chunksize=self.settings.chunk_size),
+                    )
+                except Exception as exception:
+                    files_error += 1
+                    self.log.warning(
+                        "Upload of file: {file} to the bucket: {bucket} failed! {exception}",
+                        file=s3_file_path,
+                        bucket=self.settings.s3_bucket_name,
+                        exception=exception
+                    )
+                    continue
 
             self.log.info(
                 "Successfully uploaded file: {adls_path} to the S3 bucket: {s3_bucket} at: {s3_path}",
