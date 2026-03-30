@@ -3,3 +3,4 @@ azure-identity
 boto3
 loguru
 goodconf
+goodconf[yaml]

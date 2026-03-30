@@ -3,3 +3,5 @@
 __pycache__
 fs_source/
 fs_destination/
+.env
+config.yml
