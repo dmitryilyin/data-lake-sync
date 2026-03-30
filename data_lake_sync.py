@@ -6,9 +6,12 @@ from datetime import datetime
 from datetime import timezone
 
 import boto3
+from boto3.s3.transfer import TransferConfig
+from botocore.exceptions import ClientError
 from azure.identity import ClientSecretCredential, DefaultAzureCredential
 from azure.storage.filedatalake import DataLakeServiceClient
 from loguru import logger
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -19,10 +22,6 @@ class Settings:
     def __init__(self):
         self.pretend = os.environ.get("PRETEND", "false").lower() == "true"
 
-        self.fs_mode = os.environ.get("FS_MODE", "false").lower() == "true"
-        self.source_path = os.environ.get("SOURCE_PATH", "fs_source")
-        self.destination_path = os.environ.get("DESTINATION_PATH", "fs_destination")
-
         self.adls_account_name = os.environ.get("ADLS_ACCOUNT_NAME")
         self.adls_tenant_id = os.environ.get("ADLS_TENANT_ID")
         self.adls_client_id = os.environ.get("ADLS_CLIENT_ID")
@@ -32,8 +31,13 @@ class Settings:
         self.adls_path_prefix = os.environ.get("ADLS_PATH_PREFIX", "/")
 
         self.s3_region_name = os.environ.get("S3_REGION_NAME", "us-east-1")
+        self.s3_bucket_name = os.environ.get("S3_BUCKET_NAME")
         self.s3_access_key_id = os.environ.get("S3_ACCESS_KEY_ID")
         self.s3_access_key_secret = os.environ.get("S3_ACCESS_KEY_SECRET")
+
+        self.s3_check_if_exists = os.environ.get("S3_CHECK_IF_EXISTS", "true").lower() == "true"
+        self.s3_date_prefix = os.environ.get("S3_DATE_PREFIX", "%Y-%m-%d")
+        self.s3_path_separator = os.environ.get("S3_PATH_SEPARATOR", "/")
 
         self.chunk_size = int(os.environ.get("CHUNK_SIZE", 8 * 1024 * 1024))
 
@@ -81,11 +85,17 @@ class DataLakeSync(object):
             credential = DefaultAzureCredential()
 
         try:
-            self._adls_client = DataLakeServiceClient(account_url=self.settings.adls_account_url, credential=credential)
+            self._adls_client = DataLakeServiceClient(
+                account_url=self.settings.adls_account_url,
+                credential=credential,
+                max_chunk_get_size=settings.chunk_size,
+                max_single_get_size=settings.chunk_size,
+            )
             return self._adls_client
         except Exception as exception:
             raise RuntimeError(f"Could not connect to the ADLS account! {exception}")
 
+    @property
     def s3_client(self):
         if self._s3_client is not None:
             return self._s3_client
@@ -100,14 +110,14 @@ class DataLakeSync(object):
             raise RuntimeError(f"Could not connect to the S3 bucket! {exception}")
 
     def adls_files(self, fs_client, path="/"):
-        self.log.info("List ADLS files inside path: {path}", path=path)
+        self.log.info("List the ADLS files in: {path}", path=path)
         paths = fs_client.get_paths(path=path, recursive=True)
         for file_path in paths:
             if not file_path.is_directory:
                 yield file_path
 
     def adls_file_date(self, adls_file):
-        self.log.info("Get last modified date for the ADLS file: {file}", file=adls_file.name)
+        self.log.info("Get the last modified date for the ADLS file: {file}", file=adls_file.name)
         date_last_modified = getattr(adls_file, "last_modified", None)
         if date_last_modified is None:
             return None
@@ -115,112 +125,152 @@ class DataLakeSync(object):
             date_last_modified = date_last_modified.replace(tzinfo=timezone.utc)
         return date_last_modified
 
+    def adls_is_archive(self, adls_file):
+        return Path(adls_file.name).suffix in self.archive_extensions
+
+    def s3_file_path(self, adls_file_path, adls_file_date, file_is_archive):
+        adls_file_path_clean = adls_file_path.lstrip("/")
+        adls_file_date_prefix = adls_file_date.strftime(self.settings.s3_date_prefix)
+        if len(self.settings.s3_date_prefix) > 0:
+            s3_file_path = "{0}{1}{2}".format(
+                adls_file_date_prefix,
+                self.settings.s3_path_separator,
+                adls_file_path_clean,
+            )
+        else:
+            s3_file_path = adls_file_path_clean
+
+        if not file_is_archive:
+            s3_file_path += '.gz'
+        return s3_file_path
+
+    def s3_file_exists(self, file_path):
+        try:
+            self.s3_client.head_object(Bucket=self.settings.s3_bucket_name, Key=file_path)
+            self.log.debug(
+                "The file: {path} already exists in S3 bucket: {bucket}",
+                path=file_path,
+                bucket=self.settings.s3_bucket_name,
+            )
+            return True
+        except ClientError as exception:
+            if exception.response['Error']['Code'] != "404":
+                raise exception
+        self.log.debug(
+            "The file: {path} does not exist in S3 bucket: {bucket}",
+            path=file_path,
+            bucket=self.settings.s3_bucket_name,
+        )
+        return False
+
     def sync(self):
-        fs_client = self.adls_client.get_file_system_client(file_system=self.settings.adls_container_name)
-        for adls_file in self.adls_files(fs_client, self.settings.adls_path_prefix):
+        adls_fs_client = self.adls_client.get_file_system_client(file_system=self.settings.adls_container_name)
+
+        files_total = 0
+        files_uploaded = 0
+        files_skipped = 0
+        files_error = 0
+
+        for adls_file in self.adls_files(adls_fs_client, self.settings.adls_path_prefix):
+            files_total += 1
+
             adls_file_path = adls_file.name
             adls_file_date = self.adls_file_date(adls_file)
-            file_is_archive = adls_file_path.lower().endswith(".gz")
+
+            if not adls_file_date:
+                self.log.warning("Could not get the modification date for file: {file}", file=adls_file_path)
+                files_error += 1
+                continue
+
+            adls_file_is_archive = self.adls_is_archive(adls_file)
+            s3_file_path = self.s3_file_path(adls_file_path, adls_file_date, adls_file_is_archive)
+
             self.log.info(
-                "ADLS file: {path} [{date}] Archive: {archive}",
+                "Syncing ADLS file: {path} [{date}] archive={archive} to the S3 file: {s3_file}",
                 path=adls_file_path,
                 date=adls_file_date,
-                archive=file_is_archive,
+                archive=adls_file_is_archive,
+                s3_file=s3_file_path,
             )
 
-    # def source_iterate_fs(self):
-    #     source_root = Path(self.settings.source_path).resolve()
-    #     self.log.info(
-    #         'Starting source fs iterator for: {source_path} => {root_path}',
-    #         source_path=self.settings.source_path,
-    #         root_path=source_root,
-    #     )
-    #     if not Path.is_dir(source_root):
-    #         raise RuntimeError(f'Source path {source_root} does not exist!')
-    #     for file_path in source_root.rglob('*'):
-    #         if file_path == source_root:
-    #             continue
-    #         if not Path.is_file(file_path):
-    #             continue
-    #
-    #         timestamp = file_path.stat().st_mtime
-    #         update_date = datetime.fromtimestamp(timestamp)
-    #
-    #         yield file_path, update_date
-    #
-    # def sync_fs(self):
-    #     for source_file_path, source_update_date in self.source_iterate_fs():
-    #         self.log.info(
-    #             'Processing source file: {source_file_path} with update date: {source_update_date}',
-    #             source_file_path=source_file_path,
-    #             source_update_date=source_update_date,
-    #         )
-    #         is_already_archive = source_file_path.suffix.lower() in self.archive_extensions
-    #
-    #         destination_root = Path(self.settings.destination_path).resolve()
-    #         if not Path.is_dir(destination_root):
-    #             raise RuntimeError(f"Destination path: {destination_root} does not exist!")
-    #
-    #         date_prefix = source_update_date.strftime("%Y-%m-%d")
-    #
-    #         source_root = Path(self.settings.source_path).resolve()
-    #         source_file_relative_path = source_file_path.relative_to(source_root)
-    #
-    #         destination_file_path = destination_root.joinpath(date_prefix, source_file_relative_path)
-    #         if not is_already_archive:
-    #             destination_file_path = destination_file_path.with_name(destination_file_path.name + '.gz')
-    #
-    #         self.log.info(
-    #             'Destination file will be: {destination_file_path} Source is already archive: {is_already_archive}',
-    #             destination_file_path=destination_file_path,
-    #             is_already_archive=is_already_archive,
-    #         )
-    #
-    #         destination_file_path.parent.mkdir(parents=True, exist_ok=True)
-    #
-    #         if is_already_archive:
-    #
-    #             with source_file_path.open('rb') as source_file_in:
-    #                 with destination_file_path.open('wb') as destination_file_out:
-    #                     try:
-    #                         while True:
-    #                             chunk = source_file_in.read(self.settings.chunk_size)
-    #                             if not chunk:
-    #                                 break
-    #                             destination_file_out.write(chunk)
-    #                     except Exception as exception:
-    #                         raise RuntimeError(exception)
-    #
-    #         else:
-    #
-    #             with source_file_path.open('rb') as source_file_in:
-    #                 with destination_file_path.open('wb') as destination_file_out:
-    #                     destination_gz_out = gzip.GzipFile(fileobj=destination_file_out, mode="wb")
-    #                     try:
-    #                         while True:
-    #                             chunk = source_file_in.read(self.settings.chunk_size)
-    #                             if not chunk:
-    #                                 break
-    #                             destination_gz_out.write(chunk)
-    #                     except Exception as exception:
-    #                         raise RuntimeError(exception)
-    #                     finally:
-    #                         destination_gz_out.close()
-    #
-    #         self.log.info(
-    #             'Finished writing from {source_file_path} to {destination_file_path}',
-    #             source_file_path=source_file_path,
-    #             destination_file_path=destination_file_path,
-    #             is_already_archive=is_already_archive,
-    #         )
+            if self.settings.pretend:
+                self.log.debug("Pretend is enabled, skipping...")
+                files_skipped += 1
+                continue
+
+            if self.settings.s3_check_if_exists:
+                if self.s3_file_exists(s3_file_path):
+                    self.log.debug("File already exists, skipping...")
+                    files_skipped += 1
+                    continue
+
+            adls_file_client = adls_fs_client.get_file_client(adls_file_path)
+            adls_file_download = adls_file_client.download_file()
+
+            upload_buffer = io.BytesIO()
+
+            try:
+                if adls_file_is_archive:
+                    self.log.debug("File is already an archive. Uploading without compression.")
+                    for chunk in adls_file_download.chunks():
+                        upload_buffer.write(chunk)
+                else:
+                    self.log.debug("File is not archive. Compressing the file with gzip during upload.")
+                    with gzip.GzipFile(fileobj=upload_buffer, mode='wb') as gz_io:
+                        for chunk in adls_file_download.chunks():
+                            gz_io.write(chunk)
+            except Exception as exception:
+                files_error += 1
+                self.log.warning(
+                    "Reading the file: {file} from the ADLS container: {container} failed! {exception}",
+                    file=adls_file_path,
+                    container=self.settings.adls_container_name,
+                    exception=exception
+                )
+                continue
+
+            upload_buffer.seek(0)
+
+            try:
+                self.s3_client.upload_fileobj(
+                    upload_buffer,
+                    self.settings.s3_bucket_name,
+                    s3_file_path,
+                    Config=TransferConfig(multipart_chunksize=settings.chunk_size),
+                )
+            except Exception as exception:
+                files_error += 1
+                self.log.warning(
+                    "Upload of file: {file} to the bucket: {bucket} failed! {exception}",
+                    file=s3_file_path,
+                    bucket=self.settings.s3_bucket_name,
+                    exception=exception
+                )
+                continue
+
+            self.log.info(
+                "Successfully uploaded file: {adls_path} to the S3 bucket: {s3_bucket} at: {s3_path}",
+                adls_path=adls_file_path,
+                s3_bucket=self.settings.s3_bucket_name,
+                s3_path=s3_file_path,
+            )
+            files_uploaded += 1
+
+        self.log.info(
+            "Sync Stats: total={total}, uploaded={uploaded}, skipped={skipped}, error={error}",
+            total=files_total,
+            uploaded=files_uploaded,
+            skipped=files_skipped,
+            error=files_error,
+        )
 
     def main(self):
         self.log.info('Start!')
         self.sync()
+        self.log.info('End!')
 
 
 if __name__ == "__main__":
     settings = Settings()
-
     dls = DataLakeSync(settings=settings)
     dls.main()
