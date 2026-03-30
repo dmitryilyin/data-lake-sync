@@ -1,6 +1,5 @@
-azure-storage-file-datalake
-azure-identity
 boto3
+azure-identity
+azure-storage-file-datalake
 loguru
-goodconf
-goodconf[yaml]
+python-dotenv

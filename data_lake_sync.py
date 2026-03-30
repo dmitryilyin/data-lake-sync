@@ -1,5 +1,6 @@
 import gzip
 import io
+import sys
 import os
 from datetime import timezone
 
@@ -38,6 +39,7 @@ class Settings:
         self.s3_path_separator = os.environ.get("S3_PATH_SEPARATOR", "/")
 
         self.chunk_size = int(os.environ.get("CHUNK_SIZE", 8 * 1024 * 1024))
+        self.log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 
     @property
     def adls_account_url(self):
@@ -70,16 +72,17 @@ class DataLakeSync(object):
         if self._adls_client is not None:
             return self._adls_client
 
-        self.log.info("Creating the ADLS client for account: {account}", account=self.settings.adls_account_name)
+        self.log.info(
+            "Creating the ADLS client for account: {account}",
+            account=self.settings.adls_account_name,
+        )
         if self.settings.adls_credentials_present:
-            self.log.info("Azure auth: service-principal credential")
             credential = ClientSecretCredential(
                 tenant_id=self.settings.adls_tenant_id,
                 client_id=self.settings.adls_client_id,
                 client_secret=self.settings.adls_client_secret,
             )
         else:
-            self.log.info("Azure auth: DefaultAzureCredential (Managed Identity / az login / env)")
             credential = DefaultAzureCredential()
 
         try:
@@ -97,6 +100,11 @@ class DataLakeSync(object):
     def s3_client(self):
         if self._s3_client is not None:
             return self._s3_client
+        self.log.info(
+            "Creating the S3 client for bucket: {bucket} in: {region}",
+            bucket=self.settings.s3_bucket_name,
+            region=self.settings.s3_region_name,
+        )
         client_settings = {"region_name": self.settings.s3_region_name}
         if self.settings.s3_credentials_present:
             client_settings["aws_access_key_id"] = self.settings.s3_access_key_id
@@ -108,14 +116,14 @@ class DataLakeSync(object):
             raise RuntimeError(f"Could not connect to the S3 bucket! {exception}")
 
     def adls_files(self, fs_client, path="/"):
-        self.log.info("List the ADLS files in: {path}", path=path)
+        self.log.debug("List the ADLS files in: {path}", path=path)
         paths = fs_client.get_paths(path=path, recursive=True)
         for file_path in paths:
             if not file_path.is_directory:
                 yield file_path
 
     def adls_file_date(self, adls_file):
-        self.log.info("Get the last modified date for the ADLS file: {file}", file=adls_file.name)
+        self.log.debug("Get the last modified date for the ADLS file: {file}", file=adls_file.name)
         date_last_modified = getattr(adls_file, "last_modified", None)
         if date_last_modified is None:
             return None
@@ -198,7 +206,7 @@ class DataLakeSync(object):
 
             if self.settings.s3_check_if_exists:
                 if self.s3_file_exists(s3_file_path):
-                    self.log.debug("File already exists, skipping...")
+                    self.log.info("S3 file: {file} already exists, skipping...", file=s3_file_path)
                     files_skipped += 1
                     continue
 
@@ -263,12 +271,13 @@ class DataLakeSync(object):
         )
 
     def main(self):
-        self.log.info('Start!')
+        self.log.info('Script START')
         self.sync()
-        self.log.info('End!')
+        self.log.info('Script END')
 
 
 if __name__ == "__main__":
     settings = Settings()
-    dls = DataLakeSync(settings=settings)
-    dls.main()
+    logger.remove()
+    logger.add(sys.stdout, level=settings.log_level)
+    DataLakeSync(settings=settings).main()
