@@ -216,18 +216,18 @@ class DataLakeSync(object):
                     continue
 
             adls_file_client = adls_fs_client.get_file_client(adls_file_path)
-            adls_file_download = adls_file_client.download_file()
 
             with io.BytesIO() as upload_buffer:
 
                 try:
+                    adls_file_download = adls_file_client.download_file()
                     if adls_file_is_archive:
                         self.log.debug("File is already an archive. Uploading without compression.")
                         for chunk in adls_file_download.chunks():
                             upload_buffer.write(chunk)
                     else:
                         self.log.debug("File is not archive. Compressing the file with gzip during upload.")
-                        with gzip.GzipFile(fileobj=upload_buffer, mode='wb') as gz_io:
+                        with gzip.GzipFile(fileobj=upload_buffer, mode='wb', mtime=0) as gz_io:
                             for chunk in adls_file_download.chunks():
                                 gz_io.write(chunk)
                 except Exception as exception:
@@ -247,7 +247,10 @@ class DataLakeSync(object):
                         upload_buffer,
                         self.settings.s3_bucket_name,
                         s3_file_path,
-                        Config=TransferConfig(multipart_chunksize=self.settings.chunk_size),
+                        Config=TransferConfig(
+                            multipart_chunksize=self.settings.chunk_size,
+                            multipart_threshold=self.settings.chunk_size,
+                        ),
                     )
                 except Exception as exception:
                     files_error += 1
