@@ -3,6 +3,7 @@ DIR=`dirname $0`
 cd "${DIR}" || exit 1
 
 REPO="dilyin/data-lake-sync"
-TAG="latest"
+TAG="1"
 
-sudo docker build -t "${REPO}:${TAG}" .
+docker build -t "${REPO}:latest" .
+docker tag "${REPO}:latest" "${REPO}:${TAG}"

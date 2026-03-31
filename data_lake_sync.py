@@ -29,6 +29,7 @@ class Settings:
         self.adls_container_name = os.environ.get("ADLS_CONTAINER_NAME")
         self.adls_path_prefix = os.environ.get("ADLS_PATH_PREFIX", "/")
 
+        self.s3_endpoint_url = os.environ.get("S3_ENDPOINT_URL")
         self.s3_region_name = os.environ.get("S3_REGION_NAME", "us-east-1")
         self.s3_bucket_name = os.environ.get("S3_BUCKET_NAME")
         self.s3_access_key_id = os.environ.get("S3_ACCESS_KEY_ID")
@@ -105,10 +106,14 @@ class DataLakeSync(object):
             bucket=self.settings.s3_bucket_name,
             region=self.settings.s3_region_name,
         )
-        client_settings = {"region_name": self.settings.s3_region_name}
+        client_settings = {}
         if self.settings.s3_credentials_present:
             client_settings["aws_access_key_id"] = self.settings.s3_access_key_id
             client_settings["aws_secret_access_key"] = self.settings.s3_access_key_secret
+        if self.settings.s3_endpoint_url:
+            client_settings["endpoint_url"] = self.settings.s3_endpoint_url
+        if self.settings.s3_region_name:
+            client_settings["region_name"] = self.settings.s3_region_name
         try:
             self._s3_client = boto3.client("s3", **client_settings)
             return self._s3_client
